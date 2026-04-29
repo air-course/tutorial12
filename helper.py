@@ -11,6 +11,8 @@ Contains everything that students do NOT need to implement themselves:
   - SRBDSimulator      : Drake-based floating-body simulator that receives
                          GRFs at known foot locations and returns the next state
   - plot_contact_schedule / plot_run / plot_feet_3d : visualisation helpers
+  - run_controller_simulation / animate_swingup_simulation :
+                         local double-pendulum simulation helpers
   - skew, Rz           : small math utilities
 
 Leg index convention used throughout:
@@ -29,6 +31,160 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
+
+
+def _make_swingup_rhs_function(model):
+    """Return a numerical RHS f(x, u) from an AcadosModel."""
+    import casadi as ca
+
+    return ca.Function(
+        "double_pendulum_rhs",
+        [model.x, model.u],
+        [model.f_expl_expr],
+    )
+
+
+def _rk4_step(rhs, x, u, dt):
+    """One explicit Runge-Kutta integration step."""
+    k1 = np.array(rhs(x, u)).reshape(-1)
+    k2 = np.array(rhs(x + 0.5 * dt * k1, u)).reshape(-1)
+    k3 = np.array(rhs(x + 0.5 * dt * k2, u)).reshape(-1)
+    k4 = np.array(rhs(x + dt * k3, u)).reshape(-1)
+    return x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+
+def run_controller_simulation(solver, model,
+                              u_max_1, u_max_2, v_max,
+                              Tf_sim=5.0,
+                              sim_dt=0.002,
+                              mpc_period=0.02,
+                              x0=None,
+                              warm_start_steps=200,
+                              motor_response=1.0,
+                              process_noise=None,
+                              measurement_noise=None,
+                              stop_on_solver_failure=False,
+                              do_plot=True):
+    """Run a swing-up NMPC controller against the notebook dynamics model.
+
+    The helper mirrors the hardware ``run_controller`` interface, but replaces
+    the CloudPendulum client with a local RK4 simulation. The controller is
+    evaluated every ``mpc_period`` seconds and the torque is held constant
+    between MPC updates.
+    """
+    rhs = _make_swingup_rhs_function(model)
+    x = np.zeros(4) if x0 is None else np.array(x0, dtype=float).reshape(4)
+    u_cmd = np.zeros(2)
+    u_applied = np.zeros(2)
+
+    process_noise = (np.zeros(4) if process_noise is None
+                     else np.asarray(process_noise))
+    measurement_noise = (np.zeros(4) if measurement_noise is None
+                         else np.asarray(measurement_noise))
+
+    # Warm-start the SQP trajectory from the simulation initial state.
+    x_ws = x.copy()
+    for _ in range(warm_start_steps):
+        solver.set(0, "lbx", x_ws)
+        solver.set(0, "ubx", x_ws)
+        solver.solve()
+        x_ws = np.array(solver.get(1, "x")).reshape(-1)
+
+    ts, xs, us, solver_status = [], [], [], []
+    next_mpc = 0.0
+    t = 0.0
+    while t < Tf_sim:
+        if t + 1e-12 >= next_mpc:
+            x_meas = x + np.random.normal(0.0, measurement_noise, size=4)
+            x_meas[2:] = np.clip(x_meas[2:], -v_max, v_max)
+
+            solver.set(0, "lbx", x_meas)
+            solver.set(0, "ubx", x_meas)
+            status = solver.solve()
+            solver_status.append(status)
+
+            if status != 0 and stop_on_solver_failure:
+                print(f"Stopping simulation at t={t:.3f}s, solver status={status}")
+                break
+
+            candidate = np.array(solver.get(0, "u")).reshape(-1)
+            if np.all(np.isfinite(candidate)):
+                u_cmd = candidate
+            u_cmd[0] = np.clip(u_cmd[0], -u_max_1, u_max_1)
+            u_cmd[1] = np.clip(u_cmd[1], -u_max_2, u_max_2)
+            next_mpc += mpc_period
+
+        u_applied = u_applied + motor_response * (u_cmd - u_applied)
+        x = _rk4_step(rhs, x, u_applied, sim_dt)
+        if np.any(process_noise > 0.0):
+            x += np.random.normal(0.0, process_noise, size=4)
+
+        t += sim_dt
+        ts.append(t)
+        xs.append(x.copy())
+        us.append(u_applied.copy())
+
+    ts = np.asarray(ts)
+    xs = np.asarray(xs)
+    us = np.asarray(us)
+
+    if len(ts) > 0 and do_plot:
+        plot_run(ts, xs, us, solver_status=solver_status)
+        err = np.array([
+            np.arctan2(np.sin(xs[-1, 0] - np.pi), np.cos(xs[-1, 0] - np.pi)),
+            np.arctan2(np.sin(xs[-1, 1]), np.cos(xs[-1, 1])),
+        ])
+        print("Final state:", xs[-1])
+        print("Wrapped angle error to [pi, 0]:", err)
+        if solver_status:
+            unique, counts = np.unique(solver_status, return_counts=True)
+            print("Solver status counts:", dict(zip(unique.tolist(),
+                                                    counts.tolist())))
+
+    return dict(ts=ts, xs=xs, us=us, solver_status=solver_status)
+
+
+simulate_swingup_controller = run_controller_simulation
+
+
+def animate_swingup_simulation(ts, xs, l1=0.05, l2=0.05, skip=5,
+                               interval_ms=30):
+    """Animate a simulated double-pendulum trajectory in a notebook."""
+    import matplotlib.pyplot as plt
+    from IPython.display import HTML
+    from matplotlib.animation import FuncAnimation
+
+    ts = np.asarray(ts)[::skip]
+    xs = np.asarray(xs)[::skip]
+    if len(ts) == 0:
+        raise ValueError("No trajectory data to animate.")
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    reach = 1.1 * (l1 + l2)
+    ax.set_xlim(-reach, reach)
+    ax.set_ylim(-reach, reach)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.3)
+    line, = ax.plot([], [], "-o", lw=4, markersize=8)
+    title = ax.set_title("")
+
+    def points(q1, q2):
+        p0 = np.array([0.0, 0.0])
+        p1 = p0 + np.array([l1 * np.sin(q1), -l1 * np.cos(q1)])
+        p2 = p1 + np.array([l2 * np.sin(q1 + q2),
+                            -l2 * np.cos(q1 + q2)])
+        return np.vstack([p0, p1, p2])
+
+    def update(i):
+        p = points(xs[i, 0], xs[i, 1])
+        line.set_data(p[:, 0], p[:, 1])
+        title.set_text(f"t = {ts[i]:.2f} s")
+        return line, title
+
+    anim = FuncAnimation(fig, update, frames=len(ts), interval=interval_ms,
+                         blit=True, repeat=False)
+    plt.close(fig)
+    return HTML(anim.to_jshtml())
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +645,7 @@ def start_meshcat(host: Optional[str] = None,
                   port: Optional[int] = None,
                   web_url_pattern: Optional[str] = None,
                   hub_host: Optional[str] = None,
-                  verbose: bool = True):
+                  verbose: bool = False):
     """Start a Meshcat server with sensible defaults for hosted Jupyters.
 
     Drake's :func:`StartMeshcat` does **not** recognise JupyterHub on its
